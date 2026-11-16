@@ -1,0 +1,212 @@
+{
+  "fixture_meta": {
+    "fixture_version": "1.0.0",
+    "description": "Sanitized, fully synthetic outbound sequence metrics for SANDBOX_MODE. Every ID, name, domain and number in this file is fictional.",
+    "synthetic": true,
+    "contains_real_data": false,
+    "as_of": "2026-11-16T07:00:00Z",
+    "lookback_window_days": 7,
+    "workspace_id": "ws_demo_001",
+    "platform": "generic-mock"
+  },
+  "mailboxes": [
+    {
+      "mailbox_id": "mbx_01",
+      "email": "alex.demo@send1.example.com",
+      "sending_domain": "send1.example.com",
+      "provider": "google",
+      "status": "active",
+      "daily_limit": 40,
+      "daily_volume_avg_7d": 34,
+      "sent_7d": 238,
+      "bounces_7d": 2,
+      "spam_complaints_7d": 0,
+      "warmup_reputation_pct": 97
+    },
+    {
+      "mailbox_id": "mbx_02",
+      "email": "blair.demo@send1.example.com",
+      "sending_domain": "send1.example.com",
+      "provider": "microsoft",
+      "status": "active",
+      "daily_limit": 40,
+      "daily_volume_avg_7d": 31,
+      "sent_7d": 217,
+      "bounces_7d": 3,
+      "spam_complaints_7d": 0,
+      "warmup_reputation_pct": 95
+    },
+    {
+      "mailbox_id": "mbx_03",
+      "email": "casey.demo@send2.example.com",
+      "sending_domain": "send2.example.com",
+      "provider": "google",
+      "status": "active",
+      "daily_limit": 40,
+      "daily_volume_avg_7d": 36,
+      "sent_7d": 252,
+      "bounces_7d": 3,
+      "spam_complaints_7d": 0,
+      "warmup_reputation_pct": 94
+    },
+    {
+      "mailbox_id": "mbx_04",
+      "email": "devon.demo@send2.example.com",
+      "sending_domain": "send2.example.com",
+      "provider": "google",
+      "status": "active",
+      "daily_limit": 40,
+      "daily_volume_avg_7d": 33,
+      "sent_7d": 231,
+      "bounces_7d": 6,
+      "spam_complaints_7d": 0,
+      "warmup_reputation_pct": 88
+    },
+    {
+      "mailbox_id": "mbx_05",
+      "email": "emery.demo@send3.example.com",
+      "sending_domain": "send3.example.com",
+      "provider": "microsoft",
+      "status": "active",
+      "daily_limit": 35,
+      "daily_volume_avg_7d": 30,
+      "sent_7d": 210,
+      "bounces_7d": 8,
+      "spam_complaints_7d": 0,
+      "warmup_reputation_pct": 84
+    },
+    {
+      "mailbox_id": "mbx_06",
+      "email": "finley.demo@send3.example.com",
+      "sending_domain": "send3.example.com",
+      "provider": "google",
+      "status": "active",
+      "daily_limit": 35,
+      "daily_volume_avg_7d": 29,
+      "sent_7d": 203,
+      "bounces_7d": 13,
+      "spam_complaints_7d": 1,
+      "warmup_reputation_pct": 71
+    },
+    {
+      "mailbox_id": "mbx_07",
+      "email": "harper.demo@send4.example.com",
+      "sending_domain": "send4.example.com",
+      "provider": "google",
+      "status": "active",
+      "daily_limit": 40,
+      "daily_volume_avg_7d": 32,
+      "sent_7d": 224,
+      "bounces_7d": 2,
+      "spam_complaints_7d": 0,
+      "warmup_reputation_pct": 98
+    },
+    {
+      "mailbox_id": "mbx_08",
+      "email": "indigo.demo@send4.example.com",
+      "sending_domain": "send4.example.com",
+      "provider": "microsoft",
+      "status": "active",
+      "daily_limit": 40,
+      "daily_volume_avg_7d": 39,
+      "sent_7d": 273,
+      "bounces_7d": 4,
+      "spam_complaints_7d": 0,
+      "warmup_reputation_pct": 92
+    }
+  ],
+  "campaigns": [
+    {
+      "campaign_id": "77001",
+      "name": "Q4 FinOps Leaders - Mid-Market",
+      "status": "active",
+      "segment": "finops-midmarket",
+      "mailbox_ids": ["mbx_01", "mbx_02"],
+      "active_prospects": 420,
+      "baseline_velocity_index_30d": 1.05,
+      "steps": [
+        { "step_number": 1, "delay_days": 0, "channel": "email", "template_ref": "tpl_77001_s1", "sent": 455, "opens": 0, "clicks": 12, "replies": 17, "unsubscribes": 2, "median_hours_to_engagement": 18 },
+        { "step_number": 2, "delay_days": 3, "channel": "email", "template_ref": "tpl_77001_s2", "sent": 402, "opens": 0, "clicks": 9, "replies": 12, "unsubscribes": 1, "median_hours_to_engagement": 22 },
+        { "step_number": 3, "delay_days": 4, "channel": "email", "template_ref": "tpl_77001_s3", "sent": 360, "opens": 0, "clicks": 4, "replies": 6, "unsubscribes": 1, "median_hours_to_engagement": 40 },
+        { "step_number": 4, "delay_days": 5, "channel": "email", "template_ref": "tpl_77001_s4", "sent": 318, "opens": 0, "clicks": 2, "replies": 4, "unsubscribes": 1, "median_hours_to_engagement": 52 }
+      ]
+    },
+    {
+      "campaign_id": "77002",
+      "name": "RevOps Directors - Series B SaaS",
+      "status": "active",
+      "segment": "revops-series-b",
+      "mailbox_ids": ["mbx_03", "mbx_07", "mbx_08"],
+      "active_prospects": 680,
+      "baseline_velocity_index_30d": 0.95,
+      "steps": [
+        { "step_number": 1, "delay_days": 0, "channel": "email", "template_ref": "tpl_77002_s1", "sent": 610, "opens": 0, "clicks": 4, "replies": 5, "unsubscribes": 3, "median_hours_to_engagement": 96 },
+        { "step_number": 2, "delay_days": 3, "channel": "email", "template_ref": "tpl_77002_s2", "sent": 560, "opens": 0, "clicks": 6, "replies": 7, "unsubscribes": 2, "median_hours_to_engagement": 70 },
+        { "step_number": 3, "delay_days": 4, "channel": "email", "template_ref": "tpl_77002_s3", "sent": 510, "opens": 0, "clicks": 4, "replies": 5, "unsubscribes": 2, "median_hours_to_engagement": 80 },
+        { "step_number": 4, "delay_days": 5, "channel": "email", "template_ref": "tpl_77002_s4", "sent": 470, "opens": 0, "clicks": 2, "replies": 3, "unsubscribes": 1, "median_hours_to_engagement": 90 }
+      ]
+    },
+    {
+      "campaign_id": "77003",
+      "name": "IT Security Buyers - Enterprise",
+      "status": "active",
+      "segment": "itsec-enterprise",
+      "mailbox_ids": ["mbx_04", "mbx_05", "mbx_06"],
+      "active_prospects": 590,
+      "baseline_velocity_index_30d": 0.9,
+      "steps": [
+        { "step_number": 1, "delay_days": 0, "channel": "email", "template_ref": "tpl_77003_s1", "sent": 590, "opens": 0, "clicks": 8, "replies": 11, "unsubscribes": 3, "median_hours_to_engagement": 30 },
+        { "step_number": 2, "delay_days": 3, "channel": "email", "template_ref": "tpl_77003_s2", "sent": 540, "opens": 0, "clicks": 10, "replies": 14, "unsubscribes": 2, "median_hours_to_engagement": 20 },
+        { "step_number": 3, "delay_days": 4, "channel": "email", "template_ref": "tpl_77003_s3", "sent": 500, "opens": 0, "clicks": 5, "replies": 6, "unsubscribes": 2, "median_hours_to_engagement": 50 },
+        { "step_number": 4, "delay_days": 5, "channel": "email", "template_ref": "tpl_77003_s4", "sent": 455, "opens": 0, "clicks": 3, "replies": 3, "unsubscribes": 1, "median_hours_to_engagement": 60 }
+      ]
+    },
+    {
+      "campaign_id": "77004",
+      "name": "Founders - Seed Stage Pilot",
+      "status": "active",
+      "segment": "founders-seed",
+      "mailbox_ids": ["mbx_07"],
+      "active_prospects": 70,
+      "baseline_velocity_index_30d": null,
+      "steps": [
+        { "step_number": 1, "delay_days": 0, "channel": "email", "template_ref": "tpl_77004_s1", "sent": 64, "opens": 0, "clicks": 3, "replies": 4, "unsubscribes": 0, "median_hours_to_engagement": 12 },
+        { "step_number": 2, "delay_days": 2, "channel": "email", "template_ref": "tpl_77004_s2", "sent": 50, "opens": 0, "clicks": 1, "replies": 2, "unsubscribes": 0, "median_hours_to_engagement": 20 },
+        { "step_number": 3, "delay_days": 3, "channel": "email", "template_ref": "tpl_77004_s3", "sent": 41, "opens": 0, "clicks": 0, "replies": 1, "unsubscribes": 0, "median_hours_to_engagement": null }
+      ]
+    },
+    {
+      "campaign_id": "77005",
+      "name": "Legacy Partner Webinar Follow-up",
+      "status": "paused",
+      "segment": "partner-webinar",
+      "mailbox_ids": ["mbx_02"],
+      "active_prospects": 0,
+      "baseline_velocity_index_30d": 0.6,
+      "steps": [
+        { "step_number": 1, "delay_days": 0, "channel": "email", "template_ref": "tpl_77005_s1", "sent": 300, "opens": 0, "clicks": 2, "replies": 2, "unsubscribes": 4, "median_hours_to_engagement": 110 },
+        { "step_number": 2, "delay_days": 2, "channel": "email", "template_ref": "tpl_77005_s2", "sent": 280, "opens": 0, "clicks": 1, "replies": 1, "unsubscribes": 3, "median_hours_to_engagement": 120 }
+      ]
+    }
+  ],
+  "prospects": [
+    { "prospect_id": "prs_0001", "first_name": "Jordan", "last_name": "Sample", "company": "Northwind Example Co", "email": "jordan.sample@northwind.example.com", "campaign_id": "77001", "current_step": 2 },
+    { "prospect_id": "prs_0002", "first_name": "Riley", "last_name": "Placeholder", "company": "Contoso Example Ltd", "email": "riley.placeholder@contoso.example.com", "campaign_id": "77001", "current_step": 2 },
+    { "prospect_id": "prs_0003", "first_name": "Morgan", "last_name": "Testcase", "company": "Fabrikam Example Inc", "email": "morgan.testcase@fabrikam.example.com", "campaign_id": "77001", "current_step": 1 },
+    { "prospect_id": "prs_0004", "first_name": "Quinn", "last_name": "Mockdata", "company": "Tailspin Example LLC", "email": "quinn.mockdata@tailspin.example.com", "campaign_id": "77001", "current_step": 3 },
+    { "prospect_id": "prs_0005", "first_name": "Avery", "last_name": "Fixture", "company": "Litware Example Group", "email": "avery.fixture@litware.example.com", "campaign_id": "77001", "current_step": 2 },
+    { "prospect_id": "prs_0006", "first_name": "Rowan", "last_name": "Synthetic", "company": "Adatum Example Corp", "email": "rowan.synthetic@adatum.example.com", "campaign_id": "77001", "current_step": 2 },
+    { "prospect_id": "prs_0007", "first_name": "Sage", "last_name": "Demo", "company": "Proseware Example Co", "email": "sage.demo@proseware.example.com", "campaign_id": "77001", "current_step": 2 },
+    { "prospect_id": "prs_0008", "first_name": "Taylor", "last_name": "Example", "company": "Woodgrove Example Partners", "email": "taylor.example@woodgrove.example.com", "campaign_id": "77001", "current_step": 2 }
+  ],
+  "prospect_engagement_events": [
+    { "event_id": "evt_0001", "prospect_id": "prs_0001", "campaign_id": "77001", "step_number": 1, "event": "reply", "hours_since_send": 4 },
+    { "event_id": "evt_0002", "prospect_id": "prs_0002", "campaign_id": "77001", "step_number": 1, "event": "click", "hours_since_send": 9 },
+    { "event_id": "evt_0003", "prospect_id": "prs_0003", "campaign_id": "77001", "step_number": 1, "event": "reply", "hours_since_send": 12 },
+    { "event_id": "evt_0004", "prospect_id": "prs_0004", "campaign_id": "77001", "step_number": 1, "event": "reply", "hours_since_send": 16 },
+    { "event_id": "evt_0005", "prospect_id": "prs_0005", "campaign_id": "77001", "step_number": 1, "event": "click", "hours_since_send": 18 },
+    { "event_id": "evt_0006", "prospect_id": "prs_0006", "campaign_id": "77001", "step_number": 1, "event": "reply", "hours_since_send": 22 },
+    { "event_id": "evt_0007", "prospect_id": "prs_0007", "campaign_id": "77001", "step_number": 1, "event": "reply", "hours_since_send": 30 },
+    { "event_id": "evt_0008", "prospect_id": "prs_0008", "campaign_id": "77001", "step_number": 1, "event": "click", "hours_since_send": 41 }
+  ]
+}
