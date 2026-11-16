@@ -29,6 +29,8 @@ It is **safe by default**. Imported as-is, it reads a synthetic fixture, makes *
 
 ## 1. Architecture overview
 
+![Outbound Sequence Step Pacing Optimization Engine Workflow Overview](https://raw.githubusercontent.com/dhrobinsystems/n8n-outbound-sequence-step-pacing-optimization-engine/main/workflow-overview.png)
+
 | Stage | Node(s) | Purpose |
 |---|---|---|
 | Triggers | `Daily 07:00 UTC Schedule`, `Manual Test Trigger` | Daily cron (`0 7 * * *`, workflow timezone UTC) or an on-demand test run |
