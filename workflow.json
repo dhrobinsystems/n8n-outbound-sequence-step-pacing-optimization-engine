@@ -1,0 +1,839 @@
+{
+  "name": "Outbound Sequence Step Pacing Optimization Engine",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      },
+      "id": "a6f09318-0ea0-5abd-941d-3883b42d8708",
+      "name": "Daily 07:00 UTC Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        200
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "b891a7ff-b914-531f-a781-7e0ebeaf4146",
+      "name": "Manual Test Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Config & Safety Gate\n// Reads every setting from environment variables, validates it and\n// computes the effective safety gate. Secrets are NEVER copied into the\n// execution data: only \"is it set?\" booleans leave this node.\n// Any unreadable, missing or invalid value falls back to the SAFE default.\n// =====================================================================\nlet envAccessBlocked = false;\nconst gateWarnings = [];\nconst configErrors = [];\n\nconst readEnv = (key) => {\n  try {\n    const v = $env[key];\n    if (v === undefined || v === null) return undefined;\n    const s = String(v).trim();\n    return s === '' ? undefined : s;\n  } catch (e) {\n    envAccessBlocked = true;\n    return undefined;\n  }\n};\n\nconst bool = (key, safeDefault) => {\n  const v = readEnv(key);\n  if (v === undefined) return safeDefault;\n  const s = v.toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(s)) return true;\n  if (['false', '0', 'no', 'off'].includes(s)) return false;\n  gateWarnings.push(`${key}=\"${v}\" is not a boolean; using safe default ${safeDefault}.`);\n  return safeDefault;\n};\n\nconst num = (key, def, min, max) => {\n  const v = readEnv(key);\n  if (v === undefined) return def;\n  const n = Number(v);\n  if (!Number.isFinite(n) || n < min || n > max) {\n    gateWarnings.push(`${key}=\"${v}\" is outside [${min}, ${max}]; using default ${def}.`);\n    return def;\n  }\n  return n;\n};\n\nconst str = (key, def) => readEnv(key) ?? def;\n\n// ---- Safety flags (safe by default) --------------------------------\nconst requestedSandbox = bool('SANDBOX_MODE', true);\nconst requestedDryRun = bool('DRY_RUN', true);\nconst pacingUpdatesEnabled = bool('PACING_UPDATES_ENABLED', false);\nconst sendSlackAlerts = bool('SEND_SLACK_ALERTS', false);\nconst sendWebhookAlerts = bool('SEND_WEBHOOK_ALERTS', false);\n\n// ---- Secret presence checks (values are never output) --------------\nconst outboundApiKey = readEnv('OUTBOUND_API_KEY');\nconst slackWebhookUrl = readEnv('SLACK_ALERT_WEBHOOK_URL');\nconst alertWebhookUrl = readEnv('ALERT_WEBHOOK_URL');\nconst hasOutboundApiKey = Boolean(outboundApiKey);\nconst hasSlackWebhook = Boolean(slackWebhookUrl) && /^https:\\/\\//i.test(slackWebhookUrl);\nconst hasAlertWebhook = Boolean(alertWebhookUrl) && /^https:\\/\\//i.test(alertWebhookUrl);\nif (slackWebhookUrl && !hasSlackWebhook) gateWarnings.push('SLACK_ALERT_WEBHOOK_URL must start with https:// \u2014 Slack alerts disabled.');\nif (alertWebhookUrl && !hasAlertWebhook) gateWarnings.push('ALERT_WEBHOOK_URL must start with https:// \u2014 webhook alerts disabled.');\n\n// ---- Outbound platform (non-secret) --------------------------------\nconst outbound = {\n  platform: str('OUTBOUND_PLATFORM', 'generic'),\n  apiBaseUrl: str('OUTBOUND_API_BASE_URL', 'https://api.outbound-platform.example.com/v1').replace(/\\/+$/, ''),\n  mailboxHealthPath: str('OUTBOUND_MAILBOX_HEALTH_PATH', '/mailboxes/health'),\n  campaignMetricsPath: str('OUTBOUND_CAMPAIGN_METRICS_PATH', '/campaigns/sequence-metrics'),\n  pacingUpdatePath: str('OUTBOUND_PACING_UPDATE_PATH', '/campaigns/{campaign_id}/sequence-delays'),\n  campaignIdFilter: (readEnv('OUTBOUND_CAMPAIGN_IDS') || '')\n    .split(',').map((s) => s.trim()).filter(Boolean),\n  lookbackDays: num('METRICS_LOOKBACK_DAYS', 7, 1, 90),\n};\n\n// ---- Thresholds & multipliers --------------------------------------\nconst thresholds = {\n  bounceWarnPct: num('BOUNCE_RATE_WARN_PCT', 2.0, 0, 100),\n  bounceThrottlePct: num('BOUNCE_RATE_THROTTLE_PCT', 3.0, 0, 100),\n  bounceCriticalPct: num('BOUNCE_RATE_CRITICAL_PCT', 5.0, 0, 100),\n  spamWarnPct: num('SPAM_RATE_WARN_PCT', 0.1, 0, 100),\n  spamCriticalPct: num('SPAM_RATE_CRITICAL_PCT', 0.3, 0, 100),\n  volumeUtilizationWarnPct: num('VOLUME_UTILIZATION_WARN_PCT', 90, 1, 200),\n  reputationFloorPct: num('WARMUP_REPUTATION_FLOOR_PCT', 90, 0, 100),\n  minMailboxSample: num('MIN_MAILBOX_SAMPLE_SIZE', 50, 0, 100000),\n  unsubscribeGuardPct: num('UNSUBSCRIBE_RATE_GUARD_PCT', 1.0, 0, 100),\n};\n\nconst pacing = {\n  minStepDelayDays: num('MIN_STEP_DELAY_DAYS', 2, 0, 60),\n  maxStepDelayDays: num('MAX_STEP_DELAY_DAYS', 10, 1, 90),\n  maxDelayChangeDaysPerRun: num('MAX_DELAY_CHANGE_DAYS_PER_RUN', 2, 1, 30),\n  minStepSampleSize: num('MIN_STEP_SAMPLE_SIZE', 100, 1, 1000000),\n  maxCampaignsUpdatedPerRun: num('MAX_CAMPAIGNS_UPDATED_PER_RUN', 25, 1, 1000),\n};\n\nconst velocity = {\n  benchmarkReplyRatePct: num('BENCHMARK_REPLY_RATE_PCT', 2.0, 0.01, 100),\n  benchmarkClickRatePct: num('BENCHMARK_CLICK_RATE_PCT', 1.5, 0.01, 100),\n  benchmarkHoursToEngagement: num('BENCHMARK_HOURS_TO_ENGAGEMENT', 48, 1, 2000),\n  highThreshold: num('VELOCITY_HIGH_THRESHOLD', 1.3, 0, 10),\n  sluggishThreshold: num('VELOCITY_SLUGGISH_THRESHOLD', 0.8, 0, 10),\n  stalledThreshold: num('VELOCITY_STALLED_THRESHOLD', 0.5, 0, 10),\n  compressMultiplier: num('VELOCITY_COMPRESS_MULTIPLIER', 0.75, 0.1, 1),\n  expandMultiplier: num('VELOCITY_EXPAND_MULTIPLIER', 1.35, 1, 5),\n  stalledMultiplier: num('VELOCITY_STALLED_MULTIPLIER', 1.6, 1, 5),\n  shiftAlertPct: num('VELOCITY_SHIFT_ALERT_PCT', 25, 1, 1000),\n};\n\nconst health = {\n  watchMultiplier: num('HEALTH_WATCH_MULTIPLIER', 1.15, 1, 5),\n  throttleMultiplier: num('HEALTH_THROTTLE_MULTIPLIER', 1.5, 1, 5),\n};\n\nconst circuitBreaker = {\n  criticalMailboxPct: num('CIRCUIT_BREAKER_CRITICAL_MAILBOX_PCT', 30, 1, 100),\n  orgBounceRatePct: num('CIRCUIT_BREAKER_BOUNCE_RATE_PCT', 5.0, 0.1, 100),\n};\n\nconst alerts = {\n  minSeverity: (str('ALERT_MIN_SEVERITY', 'WARNING') || 'WARNING').toUpperCase(),\n  maxItemsPerSection: num('ALERT_MAX_ITEMS_PER_SECTION', 8, 1, 25),\n};\nif (!['INFO', 'WARNING', 'CRITICAL'].includes(alerts.minSeverity)) {\n  gateWarnings.push(`ALERT_MIN_SEVERITY=\"${alerts.minSeverity}\" is invalid; using WARNING.`);\n  alerts.minSeverity = 'WARNING';\n}\n\n// ---- Cross-field validation (any error => no live mutations) -------\nif (pacing.minStepDelayDays >= pacing.maxStepDelayDays) configErrors.push('MIN_STEP_DELAY_DAYS must be lower than MAX_STEP_DELAY_DAYS.');\nif (!(thresholds.bounceWarnPct < thresholds.bounceThrottlePct && thresholds.bounceThrottlePct < thresholds.bounceCriticalPct)) configErrors.push('Bounce thresholds must satisfy WARN < THROTTLE < CRITICAL.');\nif (!(thresholds.spamWarnPct < thresholds.spamCriticalPct)) configErrors.push('Spam thresholds must satisfy WARN < CRITICAL.');\nif (!(velocity.stalledThreshold < velocity.sluggishThreshold && velocity.sluggishThreshold < velocity.highThreshold)) configErrors.push('Velocity thresholds must satisfy STALLED < SLUGGISH < HIGH.');\nif (!(velocity.stalledMultiplier >= velocity.expandMultiplier)) configErrors.push('VELOCITY_STALLED_MULTIPLIER must be >= VELOCITY_EXPAND_MULTIPLIER.');\n\n// ---- Effective safety gate -----------------------------------------\nlet sandboxMode = requestedSandbox;\nconst gateReasons = [];\nif (envAccessBlocked) gateReasons.push('Environment access is blocked in this n8n instance (N8N_BLOCK_ENV_ACCESS_IN_NODE). All settings fell back to safe defaults.');\nif (!sandboxMode && !hasOutboundApiKey) { sandboxMode = true; gateReasons.push('SANDBOX_MODE=false but OUTBOUND_API_KEY is not set \u2014 forced back to sandbox.'); }\nif (!sandboxMode && !/^https:\\/\\//i.test(outbound.apiBaseUrl)) { sandboxMode = true; gateReasons.push('OUTBOUND_API_BASE_URL must use https:// \u2014 forced back to sandbox.'); }\nif (!sandboxMode && /\\.example\\.com/i.test(outbound.apiBaseUrl)) { sandboxMode = true; gateReasons.push('OUTBOUND_API_BASE_URL still points at the placeholder example.com host \u2014 forced back to sandbox.'); }\nif (configErrors.length) gateReasons.push(`Configuration errors found (${configErrors.length}) \u2014 live mutations disabled.`);\n\nconst dryRun = requestedDryRun || sandboxMode;\nconst liveMutationsPermitted = !sandboxMode && !requestedDryRun && pacingUpdatesEnabled && configErrors.length === 0;\nif (!pacingUpdatesEnabled) gateReasons.push('PACING_UPDATES_ENABLED=false \u2014 pacing changes are previewed only.');\nif (requestedDryRun) gateReasons.push('DRY_RUN=true \u2014 no writes to the outbound platform.');\nif (sandboxMode) gateReasons.push('SANDBOX_MODE=true \u2014 mock fixture data, zero network calls.');\n\nconst slackAlertsPermitted = sendSlackAlerts && !sandboxMode && hasSlackWebhook;\nconst webhookAlertsPermitted = sendWebhookAlerts && !sandboxMode && hasAlertWebhook;\n\n// ---- Run metadata --------------------------------------------------\nconst startedAt = new Date().toISOString();\nlet trigger = 'manual';\ntry { if ($('Daily 07:00 UTC Schedule').isExecuted) trigger = 'schedule'; } catch (e) { /* manual */ }\nconst runId = `pacing-${startedAt.slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 8)}`;\n\nlet mode = 'SANDBOX';\nif (!sandboxMode) mode = liveMutationsPermitted ? 'LIVE' : 'DRY_RUN';\n\nreturn [{\n  json: {\n    runId,\n    startedAt,\n    trigger,\n    workflow: 'n8n-outbound-sequence-step-pacing-optimization-engine',\n    workflowVersion: '1.0.0',\n    config: { outbound, thresholds, pacing, velocity, health, circuitBreaker, alerts },\n    gate: {\n      mode,\n      sandboxMode,\n      dryRun,\n      requested: { sandboxMode: requestedSandbox, dryRun: requestedDryRun, pacingUpdatesEnabled, sendSlackAlerts, sendWebhookAlerts },\n      liveMutationsPermitted,\n      slackAlertsPermitted,\n      webhookAlertsPermitted,\n      secretsPresent: { outboundApiKey: hasOutboundApiKey, slackWebhook: hasSlackWebhook, alertWebhook: hasAlertWebhook },\n      envAccessBlocked,\n      reasons: gateReasons,\n      warnings: gateWarnings,\n      configErrors,\n    },\n  },\n}];\n"
+      },
+      "id": "ed0a2eca-8a4a-5d14-b97c-b6cc22d862f3",
+      "name": "Config & Safety Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "b4d5bdce-5ae8-5b69-acfb-717203c50230",
+              "leftValue": "={{ $json.gate.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "51276a6e-75e9-53c6-9c1c-3d12d56df5ef",
+      "name": "Sandbox Mode?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        500,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Load Mock Fixture (SANDBOX_MODE)\n// Synthetic data only \u2014 mirrors sample-payloads/outbound-sequence-metrics-fixture.json.\n// No network calls are made on this branch.\n// =====================================================================\nconst ctx = $input.first().json;\nconst fixture = {\n  \"fixture_meta\": {\n    \"fixture_version\": \"1.0.0\",\n    \"description\": \"Sanitized, fully synthetic outbound sequence metrics for SANDBOX_MODE. Every ID, name, domain and number in this file is fictional.\",\n    \"synthetic\": true,\n    \"contains_real_data\": false,\n    \"as_of\": \"2026-11-16T07:00:00Z\",\n    \"lookback_window_days\": 7,\n    \"workspace_id\": \"ws_demo_001\",\n    \"platform\": \"generic-mock\"\n  },\n  \"mailboxes\": [\n    {\n      \"mailbox_id\": \"mbx_01\",\n      \"email\": \"alex.demo@send1.example.com\",\n      \"sending_domain\": \"send1.example.com\",\n      \"provider\": \"google\",\n      \"status\": \"active\",\n      \"daily_limit\": 40,\n      \"daily_volume_avg_7d\": 34,\n      \"sent_7d\": 238,\n      \"bounces_7d\": 2,\n      \"spam_complaints_7d\": 0,\n      \"warmup_reputation_pct\": 97\n    },\n    {\n      \"mailbox_id\": \"mbx_02\",\n      \"email\": \"blair.demo@send1.example.com\",\n      \"sending_domain\": \"send1.example.com\",\n      \"provider\": \"microsoft\",\n      \"status\": \"active\",\n      \"daily_limit\": 40,\n      \"daily_volume_avg_7d\": 31,\n      \"sent_7d\": 217,\n      \"bounces_7d\": 3,\n      \"spam_complaints_7d\": 0,\n      \"warmup_reputation_pct\": 95\n    },\n    {\n      \"mailbox_id\": \"mbx_03\",\n      \"email\": \"casey.demo@send2.example.com\",\n      \"sending_domain\": \"send2.example.com\",\n      \"provider\": \"google\",\n      \"status\": \"active\",\n      \"daily_limit\": 40,\n      \"daily_volume_avg_7d\": 36,\n      \"sent_7d\": 252,\n      \"bounces_7d\": 3,\n      \"spam_complaints_7d\": 0,\n      \"warmup_reputation_pct\": 94\n    },\n    {\n      \"mailbox_id\": \"mbx_04\",\n      \"email\": \"devon.demo@send2.example.com\",\n      \"sending_domain\": \"send2.example.com\",\n      \"provider\": \"google\",\n      \"status\": \"active\",\n      \"daily_limit\": 40,\n      \"daily_volume_avg_7d\": 33,\n      \"sent_7d\": 231,\n      \"bounces_7d\": 6,\n      \"spam_complaints_7d\": 0,\n      \"warmup_reputation_pct\": 88\n    },\n    {\n      \"mailbox_id\": \"mbx_05\",\n      \"email\": \"emery.demo@send3.example.com\",\n      \"sending_domain\": \"send3.example.com\",\n      \"provider\": \"microsoft\",\n      \"status\": \"active\",\n      \"daily_limit\": 35,\n      \"daily_volume_avg_7d\": 30,\n      \"sent_7d\": 210,\n      \"bounces_7d\": 8,\n      \"spam_complaints_7d\": 0,\n      \"warmup_reputation_pct\": 84\n    },\n    {\n      \"mailbox_id\": \"mbx_06\",\n      \"email\": \"finley.demo@send3.example.com\",\n      \"sending_domain\": \"send3.example.com\",\n      \"provider\": \"google\",\n      \"status\": \"active\",\n      \"daily_limit\": 35,\n      \"daily_volume_avg_7d\": 29,\n      \"sent_7d\": 203,\n      \"bounces_7d\": 13,\n      \"spam_complaints_7d\": 1,\n      \"warmup_reputation_pct\": 71\n    },\n    {\n      \"mailbox_id\": \"mbx_07\",\n      \"email\": \"harper.demo@send4.example.com\",\n      \"sending_domain\": \"send4.example.com\",\n      \"provider\": \"google\",\n      \"status\": \"active\",\n      \"daily_limit\": 40,\n      \"daily_volume_avg_7d\": 32,\n      \"sent_7d\": 224,\n      \"bounces_7d\": 2,\n      \"spam_complaints_7d\": 0,\n      \"warmup_reputation_pct\": 98\n    },\n    {\n      \"mailbox_id\": \"mbx_08\",\n      \"email\": \"indigo.demo@send4.example.com\",\n      \"sending_domain\": \"send4.example.com\",\n      \"provider\": \"microsoft\",\n      \"status\": \"active\",\n      \"daily_limit\": 40,\n      \"daily_volume_avg_7d\": 39,\n      \"sent_7d\": 273,\n      \"bounces_7d\": 4,\n      \"spam_complaints_7d\": 0,\n      \"warmup_reputation_pct\": 92\n    }\n  ],\n  \"campaigns\": [\n    {\n      \"campaign_id\": \"77001\",\n      \"name\": \"Q4 FinOps Leaders - Mid-Market\",\n      \"status\": \"active\",\n      \"segment\": \"finops-midmarket\",\n      \"mailbox_ids\": [\n        \"mbx_01\",\n        \"mbx_02\"\n      ],\n      \"active_prospects\": 420,\n      \"baseline_velocity_index_30d\": 1.05,\n      \"steps\": [\n        {\n          \"step_number\": 1,\n          \"delay_days\": 0,\n          \"channel\": \"email\",\n          \"template_ref\": \"tpl_77001_s1\",\n          \"sent\": 455,\n          \"opens\": 0,\n          \"clicks\": 12,\n          \"replies\": 17,\n          \"unsubscribes\": 2,\n          \"median_hours_to_engagement\": 18\n        },\n        {\n          \"step_number\": 2,\n          \"delay_days\": 3,\n          \"channel\": \"email\",\n          \"template_ref\": \"tpl_77001_s2\",\n          \"sent\": 402,\n          \"opens\": 0,\n          \"clicks\": 9,\n          \"replies\": 12,\n          \"unsubscribes\": 1,\n          \"median_hours_to_engagement\": 22\n        },\n        {\n          \"step_number\": 3,\n          \"delay_days\": 4,\n          \"channel\": \"email\",\n          \"template_ref\": \"tpl_77001_s3\",\n          \"sent\": 360,\n          \"opens\": 0,\n          \"clicks\": 4,\n          \"replies\": 6,\n          \"unsubscribes\": 1,\n          \"median_hours_to_engagement\": 40\n        },\n        {\n          \"step_number\": 4,\n          \"delay_days\": 5,\n          \"channel\": \"email\",\n          \"template_ref\": \"tpl_77001_s4\",\n          \"sent\": 318,\n          \"opens\": 0,\n          \"clicks\": 2,\n          \"replies\": 4,\n          \"unsubscribes\": 1,\n          \"median_hours_to_engagement\": 52\n        }\n      ]\n    },\n    {\n      \"campaign_id\": \"77002\",\n      \"name\": \"RevOps Directors - Series B SaaS\",\n      \"status\": \"active\",\n      \"segment\": \"revops-series-b\",\n      \"mailbox_ids\": [\n        \"mbx_03\",\n        \"mbx_07\",\n        \"mbx_08\"\n      ],\n      \"active_prospects\": 680,\n      \"baseline_velocity_index_30d\": 0.95,\n      \"steps\": [\n        {\n          \"step_number\": 1,\n          \"delay_days\": 0,\n          \"channel\": \"email\",\n          \"template_ref\": \"tpl_77002_s1\",\n          \"sent\": 610,\n          \"opens\": 0,\n          \"clicks\": 4,\n          \"replies\": 5,\n          \"unsubscribes\": 3,\n          \"median_hours_to_engagement\": 96\n        },\n        {\n          \"step_number\": 2,\n          \"delay_days\": 3,\n          \"channel\": \"email\",\n          \"template_ref\": \"tpl_77002_s2\",\n          \"sent\": 560,\n          \"opens\": 0,\n          \"clicks\": 6,\n          \"replies\": 7,\n          \"unsubscribes\": 2,\n          \"median_hours_to_engagement\": 70\n        },\n        {\n          \"step_number\": 3,\n          \"delay_days\": 4,\n          \"channel\": \"email\",\n          \"template_ref\": \"tpl_77002_s3\",\n          \"sent\": 510,\n          \"opens\": 0,\n          \"clicks\": 4,\n          \"replies\": 5,\n          \"unsubscribes\": 2,\n          \"median_hours_to_engagement\": 80\n        },\n        {\n          \"step_number\": 4,\n          \"delay_days\": 5,\n          \"channel\": \"email\",\n          \"template_ref\": \"tpl_77002_s4\",\n          \"sent\": 470,\n          \"opens\": 0,\n          \"clicks\": 2,\n          \"replies\": 3,\n          \"unsubscribes\": 1,\n          \"median_hours_to_engagement\": 90\n        }\n      ]\n    },\n    {\n      \"campaign_id\": \"77003\",\n      \"name\": \"IT Security Buyers - Enterprise\",\n      \"status\": \"active\",\n      \"segment\": \"itsec-enterprise\",\n      \"mailbox_ids\": [\n        \"mbx_04\",\n        \"mbx_05\",\n        \"mbx_06\"\n      ],\n      \"active_prospects\": 590,\n      \"baseline_velocity_index_30d\": 0.9,\n      \"steps\": [\n        {\n          \"step_number\": 1,\n          \"delay_days\": 0,\n          \"channel\": \"email\",\n          \"template_ref\": \"tpl_77003_s1\",\n          \"sent\": 590,\n          \"opens\": 0,\n          \"clicks\": 8,\n          \"replies\": 11,\n          \"unsubscribes\": 3,\n          \"median_hours_to_engagement\": 30\n        },\n        {\n          \"step_number\": 2,\n          \"delay_days\": 3,\n          \"channel\": \"email\",\n          \"template_ref\": \"tpl_77003_s2\",\n          \"sent\": 540,\n          \"opens\": 0,\n          \"clicks\": 10,\n          \"replies\": 14,\n          \"unsubscribes\": 2,\n          \"median_hours_to_engagement\": 20\n        },\n        {\n          \"step_number\": 3,\n          \"delay_days\": 4,\n          \"channel\": \"email\",\n          \"template_ref\": \"tpl_77003_s3\",\n          \"sent\": 500,\n          \"opens\": 0,\n          \"clicks\": 5,\n          \"replies\": 6,\n          \"unsubscribes\": 2,\n          \"median_hours_to_engagement\": 50\n        },\n        {\n          \"step_number\": 4,\n          \"delay_days\": 5,\n          \"channel\": \"email\",\n          \"template_ref\": \"tpl_77003_s4\",\n          \"sent\": 455,\n          \"opens\": 0,\n          \"clicks\": 3,\n          \"replies\": 3,\n          \"unsubscribes\": 1,\n          \"median_hours_to_engagement\": 60\n        }\n      ]\n    },\n    {\n      \"campaign_id\": \"77004\",\n      \"name\": \"Founders - Seed Stage Pilot\",\n      \"status\": \"active\",\n      \"segment\": \"founders-seed\",\n      \"mailbox_ids\": [\n        \"mbx_07\"\n      ],\n      \"active_prospects\": 70,\n      \"baseline_velocity_index_30d\": null,\n      \"steps\": [\n        {\n          \"step_number\": 1,\n          \"delay_days\": 0,\n          \"channel\": \"email\",\n          \"template_ref\": \"tpl_77004_s1\",\n          \"sent\": 64,\n          \"opens\": 0,\n          \"clicks\": 3,\n          \"replies\": 4,\n          \"unsubscribes\": 0,\n          \"median_hours_to_engagement\": 12\n        },\n        {\n          \"step_number\": 2,\n          \"delay_days\": 2,\n          \"channel\": \"email\",\n          \"template_ref\": \"tpl_77004_s2\",\n          \"sent\": 50,\n          \"opens\": 0,\n          \"clicks\": 1,\n          \"replies\": 2,\n          \"unsubscribes\": 0,\n          \"median_hours_to_engagement\": 20\n        },\n        {\n          \"step_number\": 3,\n          \"delay_days\": 3,\n          \"channel\": \"email\",\n          \"template_ref\": \"tpl_77004_s3\",\n          \"sent\": 41,\n          \"opens\": 0,\n          \"clicks\": 0,\n          \"replies\": 1,\n          \"unsubscribes\": 0,\n          \"median_hours_to_engagement\": null\n        }\n      ]\n    },\n    {\n      \"campaign_id\": \"77005\",\n      \"name\": \"Legacy Partner Webinar Follow-up\",\n      \"status\": \"paused\",\n      \"segment\": \"partner-webinar\",\n      \"mailbox_ids\": [\n        \"mbx_02\"\n      ],\n      \"active_prospects\": 0,\n      \"baseline_velocity_index_30d\": 0.6,\n      \"steps\": [\n        {\n          \"step_number\": 1,\n          \"delay_days\": 0,\n          \"channel\": \"email\",\n          \"template_ref\": \"tpl_77005_s1\",\n          \"sent\": 300,\n          \"opens\": 0,\n          \"clicks\": 2,\n          \"replies\": 2,\n          \"unsubscribes\": 4,\n          \"median_hours_to_engagement\": 110\n        },\n        {\n          \"step_number\": 2,\n          \"delay_days\": 2,\n          \"channel\": \"email\",\n          \"template_ref\": \"tpl_77005_s2\",\n          \"sent\": 280,\n          \"opens\": 0,\n          \"clicks\": 1,\n          \"replies\": 1,\n          \"unsubscribes\": 3,\n          \"median_hours_to_engagement\": 120\n        }\n      ]\n    }\n  ],\n  \"prospects\": [\n    {\n      \"prospect_id\": \"prs_0001\",\n      \"first_name\": \"Jordan\",\n      \"last_name\": \"Sample\",\n      \"company\": \"Northwind Example Co\",\n      \"email\": \"jordan.sample@northwind.example.com\",\n      \"campaign_id\": \"77001\",\n      \"current_step\": 2\n    },\n    {\n      \"prospect_id\": \"prs_0002\",\n      \"first_name\": \"Riley\",\n      \"last_name\": \"Placeholder\",\n      \"company\": \"Contoso Example Ltd\",\n      \"email\": \"riley.placeholder@contoso.example.com\",\n      \"campaign_id\": \"77001\",\n      \"current_step\": 2\n    },\n    {\n      \"prospect_id\": \"prs_0003\",\n      \"first_name\": \"Morgan\",\n      \"last_name\": \"Testcase\",\n      \"company\": \"Fabrikam Example Inc\",\n      \"email\": \"morgan.testcase@fabrikam.example.com\",\n      \"campaign_id\": \"77001\",\n      \"current_step\": 1\n    },\n    {\n      \"prospect_id\": \"prs_0004\",\n      \"first_name\": \"Quinn\",\n      \"last_name\": \"Mockdata\",\n      \"company\": \"Tailspin Example LLC\",\n      \"email\": \"quinn.mockdata@tailspin.example.com\",\n      \"campaign_id\": \"77001\",\n      \"current_step\": 3\n    },\n    {\n      \"prospect_id\": \"prs_0005\",\n      \"first_name\": \"Avery\",\n      \"last_name\": \"Fixture\",\n      \"company\": \"Litware Example Group\",\n      \"email\": \"avery.fixture@litware.example.com\",\n      \"campaign_id\": \"77001\",\n      \"current_step\": 2\n    },\n    {\n      \"prospect_id\": \"prs_0006\",\n      \"first_name\": \"Rowan\",\n      \"last_name\": \"Synthetic\",\n      \"company\": \"Adatum Example Corp\",\n      \"email\": \"rowan.synthetic@adatum.example.com\",\n      \"campaign_id\": \"77001\",\n      \"current_step\": 2\n    },\n    {\n      \"prospect_id\": \"prs_0007\",\n      \"first_name\": \"Sage\",\n      \"last_name\": \"Demo\",\n      \"company\": \"Proseware Example Co\",\n      \"email\": \"sage.demo@proseware.example.com\",\n      \"campaign_id\": \"77001\",\n      \"current_step\": 2\n    },\n    {\n      \"prospect_id\": \"prs_0008\",\n      \"first_name\": \"Taylor\",\n      \"last_name\": \"Example\",\n      \"company\": \"Woodgrove Example Partners\",\n      \"email\": \"taylor.example@woodgrove.example.com\",\n      \"campaign_id\": \"77001\",\n      \"current_step\": 2\n    }\n  ],\n  \"prospect_engagement_events\": [\n    {\n      \"event_id\": \"evt_0001\",\n      \"prospect_id\": \"prs_0001\",\n      \"campaign_id\": \"77001\",\n      \"step_number\": 1,\n      \"event\": \"reply\",\n      \"hours_since_send\": 4\n    },\n    {\n      \"event_id\": \"evt_0002\",\n      \"prospect_id\": \"prs_0002\",\n      \"campaign_id\": \"77001\",\n      \"step_number\": 1,\n      \"event\": \"click\",\n      \"hours_since_send\": 9\n    },\n    {\n      \"event_id\": \"evt_0003\",\n      \"prospect_id\": \"prs_0003\",\n      \"campaign_id\": \"77001\",\n      \"step_number\": 1,\n      \"event\": \"reply\",\n      \"hours_since_send\": 12\n    },\n    {\n      \"event_id\": \"evt_0004\",\n      \"prospect_id\": \"prs_0004\",\n      \"campaign_id\": \"77001\",\n      \"step_number\": 1,\n      \"event\": \"reply\",\n      \"hours_since_send\": 16\n    },\n    {\n      \"event_id\": \"evt_0005\",\n      \"prospect_id\": \"prs_0005\",\n      \"campaign_id\": \"77001\",\n      \"step_number\": 1,\n      \"event\": \"click\",\n      \"hours_since_send\": 18\n    },\n    {\n      \"event_id\": \"evt_0006\",\n      \"prospect_id\": \"prs_0006\",\n      \"campaign_id\": \"77001\",\n      \"step_number\": 1,\n      \"event\": \"reply\",\n      \"hours_since_send\": 22\n    },\n    {\n      \"event_id\": \"evt_0007\",\n      \"prospect_id\": \"prs_0007\",\n      \"campaign_id\": \"77001\",\n      \"step_number\": 1,\n      \"event\": \"reply\",\n      \"hours_since_send\": 30\n    },\n    {\n      \"event_id\": \"evt_0008\",\n      \"prospect_id\": \"prs_0008\",\n      \"campaign_id\": \"77001\",\n      \"step_number\": 1,\n      \"event\": \"click\",\n      \"hours_since_send\": 41\n    }\n  ]\n};\n\nreturn [{\n  json: {\n    ...ctx,\n    dataSource: 'MOCK_FIXTURE',\n    metrics: fixture,\n  },\n}];\n"
+      },
+      "id": "7ee815d8-e51d-5123-ab93-0196d21b8a97",
+      "name": "Load Mock Fixture",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Config & Safety Gate').first().json.config.outbound.apiBaseUrl }}{{ $('Config & Safety Gate').first().json.config.outbound.mailboxHealthPath }}",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "lookback_days",
+              "value": "={{ $('Config & Safety Gate').first().json.config.outbound.lookbackDays }}"
+            },
+            {
+              "name": "campaign_ids",
+              "value": "={{ $('Config & Safety Gate').first().json.config.outbound.campaignIdFilter.join(',') }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.OUTBOUND_API_KEY }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "66404036-69fd-5bae-a910-8e1f2cf212e1",
+      "name": "Fetch Mailbox Health (Live)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        760,
+        440
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Config & Safety Gate').first().json.config.outbound.apiBaseUrl }}{{ $('Config & Safety Gate').first().json.config.outbound.campaignMetricsPath }}",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "lookback_days",
+              "value": "={{ $('Config & Safety Gate').first().json.config.outbound.lookbackDays }}"
+            },
+            {
+              "name": "campaign_ids",
+              "value": "={{ $('Config & Safety Gate').first().json.config.outbound.campaignIdFilter.join(',') }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.OUTBOUND_API_KEY }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "41e084f5-64aa-5df9-8234-484beb24feb9",
+      "name": "Fetch Campaign Metrics (Live)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1000,
+        440
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Normalize Live Metrics\n// Maps the outbound platform (or adapter) responses onto the canonical\n// schema used by the optimization engine. Accepts common field aliases so\n// a thin adapter, or a platform that already returns similar fields,\n// can plug in. Prospect-level PII is never carried forward.\n// =====================================================================\nconst ctx = $('Config & Safety Gate').first().json;\nconst mbItems = $('Fetch Mailbox Health (Live)').all();\nconst cpItems = $('Fetch Campaign Metrics (Live)').all();\n\nconst collect = (items, key) => items.flatMap((i) => {\n  const j = i.json || {};\n  if (Array.isArray(j[key])) return j[key];\n  if (j.data && Array.isArray(j.data[key])) return j.data[key];\n  if (Array.isArray(j.data)) return j.data;\n  if (Array.isArray(j.items)) return j.items;\n  return Object.keys(j).length ? [j] : [];\n});\n\nconst first = (obj, keys, def = undefined) => {\n  for (const k of keys) {\n    if (obj[k] !== undefined && obj[k] !== null && obj[k] !== '') return obj[k];\n  }\n  return def;\n};\nconst n = (v, d = 0) => { const x = Number(v); return Number.isFinite(x) ? x : d; };\nconst nOrNull = (v) => { const x = Number(v); return v === null || v === undefined || v === '' || !Number.isFinite(x) ? null : x; };\n\nconst mailboxes = collect(mbItems, 'mailboxes').map((m) => {\n  const out = {\n    mailbox_id: String(first(m, ['mailbox_id', 'id', 'email_account_id', 'account_id'], 'unknown')),\n    sending_domain: first(m, ['sending_domain', 'domain'], null) || String(first(m, ['email', 'from_email'], '')).split('@')[1] || null,\n    provider: first(m, ['provider', 'type', 'esp'], 'unknown'),\n    status: String(first(m, ['status', 'state'], 'active')).toLowerCase(),\n    daily_limit: n(first(m, ['daily_limit', 'message_per_day', 'max_daily_sends'])),\n    daily_volume_avg_7d: n(first(m, ['daily_volume_avg_7d', 'daily_sent_avg', 'avg_daily_sent'])),\n    sent_7d: n(first(m, ['sent_7d', 'sent', 'sent_count'])),\n    warmup_reputation_pct: nOrNull(first(m, ['warmup_reputation_pct', 'warmup_reputation', 'reputation'])),\n  };\n  const bounceRate = nOrNull(first(m, ['bounce_rate_pct', 'bounce_rate']));\n  const spamRate = nOrNull(first(m, ['spam_complaint_rate_pct', 'spam_rate', 'complaint_rate']));\n  if (bounceRate !== null) out.bounce_rate_pct = bounceRate; else out.bounces_7d = n(first(m, ['bounces_7d', 'bounced', 'bounce_count']));\n  if (spamRate !== null) out.spam_complaint_rate_pct = spamRate; else out.spam_complaints_7d = n(first(m, ['spam_complaints_7d', 'spam_count', 'complaints']));\n  return out;\n});\n\nconst campaigns = collect(cpItems, 'campaigns').map((c) => ({\n  campaign_id: String(first(c, ['campaign_id', 'id'], 'unknown')),\n  name: String(first(c, ['name', 'campaign_name'], 'Unnamed campaign')),\n  status: String(first(c, ['status', 'state'], 'unknown')).toLowerCase(),\n  segment: first(c, ['segment', 'list_name', 'tag'], null),\n  mailbox_ids: (first(c, ['mailbox_ids', 'email_account_ids'], []) || []).map(String),\n  active_prospects: n(first(c, ['active_prospects', 'active_leads', 'in_progress'])),\n  baseline_velocity_index_30d: nOrNull(first(c, ['baseline_velocity_index_30d', 'baseline_velocity'])),\n  steps: (first(c, ['steps', 'sequences', 'sequence_steps'], []) || []).map((s) => ({\n    step_number: n(first(s, ['step_number', 'seq_number', 'step', 'order'])),\n    delay_days: n(first(s, ['delay_days', 'delay_in_days', 'wait_days'])),\n    sent: n(first(s, ['sent', 'sent_count'])),\n    clicks: n(first(s, ['clicks', 'click_count', 'unique_clicks'])),\n    replies: n(first(s, ['replies', 'reply_count'])),\n    unsubscribes: n(first(s, ['unsubscribes', 'unsubscribed', 'opt_outs'])),\n    median_hours_to_engagement: nOrNull(first(s, ['median_hours_to_engagement', 'median_reply_hours'])),\n  })),\n}));\n\nif (!mailboxes.length || !campaigns.length) {\n  throw new Error(`Live metrics incomplete (mailboxes=${mailboxes.length}, campaigns=${campaigns.length}). Halting before any pacing decision.`);\n}\n\nreturn [{\n  json: {\n    ...ctx,\n    dataSource: 'LIVE_API',\n    metrics: {\n      fixture_meta: { synthetic: false, as_of: new Date().toISOString(), lookback_window_days: ctx.config.outbound.lookbackDays, platform: ctx.config.outbound.platform },\n      mailboxes,\n      campaigns,\n      prospect_engagement_events: [],\n    },\n  },\n}];\n"
+      },
+      "id": "4c3c5a96-7d8e-55f0-a803-a9eb7572dc0d",
+      "name": "Normalize Live Metrics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1240,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Mailbox Health & Pacing Optimization Engine\n// 1. Scores each mailbox (bounce, spam, volume utilization, reputation).\n// 2. Rolls mailbox health up to each campaign (send-weighted).\n// 3. Computes engagement velocity per step and proposes new step gaps.\n// 4. Enforces guardrails: min/max bounds, max change per run,\n//    no compression on unhealthy campaigns, per-run update cap and a\n//    global circuit breaker for mass high-bounce events.\n// Output: one plan item. No prospect identifiers leave this node.\n// =====================================================================\nconst ctx = $input.first().json;\nconst { config: cfg, gate } = ctx;\nconst T = cfg.thresholds;\nconst P = cfg.pacing;\nconst V = cfg.velocity;\nconst H = cfg.health;\nconst CB = cfg.circuitBreaker;\n\nconst metrics = ctx.metrics || {};\nconst mailboxesIn = Array.isArray(metrics.mailboxes) ? metrics.mailboxes : [];\nconst campaignsIn = Array.isArray(metrics.campaigns) ? metrics.campaigns : [];\nconst events = Array.isArray(metrics.prospect_engagement_events) ? metrics.prospect_engagement_events : [];\n\nconst num = (v, d = 0) => { const x = Number(v); return Number.isFinite(x) ? x : d; };\nconst round = (v, p = 2) => Math.round(v * 10 ** p) / 10 ** p;\nconst clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));\nconst pct = (part, whole) => (whole > 0 ? (part / whole) * 100 : 0);\nconst median = (arr) => {\n  if (!arr.length) return null;\n  const s = [...arr].sort((a, b) => a - b);\n  const mid = Math.floor(s.length / 2);\n  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;\n};\nconst RANK = { HEALTHY: 0, WATCH: 1, THROTTLE: 2, CRITICAL: 3 };\nconst TIERS = ['HEALTHY', 'WATCH', 'THROTTLE', 'CRITICAL'];\nconst worse = (...tiers) => TIERS[Math.max(...tiers.map((t) => RANK[t] ?? 0))];\nconst tierFromScore = (s) => (s >= 80 ? 'HEALTHY' : s >= 60 ? 'WATCH' : s >= 40 ? 'THROTTLE' : 'CRITICAL');\n\n// ---------------------------------------------------------------------\n// 1. Mailbox health\n// ---------------------------------------------------------------------\nfunction bouncePenalty(b) {\n  if (b >= T.bounceCriticalPct) return 70;\n  if (b >= T.bounceThrottlePct) return 30 + ((b - T.bounceThrottlePct) / (T.bounceCriticalPct - T.bounceThrottlePct)) * 30;\n  if (b >= T.bounceWarnPct) return 10 + ((b - T.bounceWarnPct) / (T.bounceThrottlePct - T.bounceWarnPct)) * 20;\n  return (b / T.bounceWarnPct) * 10;\n}\nfunction spamPenalty(s) {\n  if (s >= T.spamCriticalPct) return 70;\n  if (s >= T.spamWarnPct) return 10 + ((s - T.spamWarnPct) / (T.spamCriticalPct - T.spamWarnPct)) * 40;\n  return (s / T.spamWarnPct) * 10;\n}\n\nconst mailboxes = mailboxesIn.map((m) => {\n  const sent = num(m.sent_7d);\n  const bounce = m.bounce_rate_pct != null ? num(m.bounce_rate_pct) : pct(num(m.bounces_7d), sent);\n  const spam = m.spam_complaint_rate_pct != null ? num(m.spam_complaint_rate_pct) : pct(num(m.spam_complaints_7d), sent);\n  const limit = num(m.daily_limit);\n  const util = limit > 0 ? pct(num(m.daily_volume_avg_7d), limit) : 0;\n  const rep = m.warmup_reputation_pct != null ? num(m.warmup_reputation_pct, 100) : 100;\n  const status = String(m.status || 'active').toLowerCase();\n  const flags = [];\n\n  const penalties = {\n    bounce: bouncePenalty(bounce),\n    spam: spamPenalty(spam),\n    volume: util > T.volumeUtilizationWarnPct ? clamp(((util - T.volumeUtilizationWarnPct) / Math.max(1, 100 - T.volumeUtilizationWarnPct)) * 10, 0, 15) : 0,\n    reputation: rep < T.reputationFloorPct ? clamp((T.reputationFloorPct - rep) * 0.5, 0, 25) : 0,\n  };\n  const score = clamp(100 - Object.values(penalties).reduce((a, b) => a + b, 0), 0, 100);\n\n  let hardTier = 'HEALTHY';\n  if (bounce >= T.bounceCriticalPct) { hardTier = 'CRITICAL'; flags.push(`Bounce ${round(bounce)}% >= critical cap ${T.bounceCriticalPct}%`); }\n  else if (bounce >= T.bounceThrottlePct) { hardTier = 'THROTTLE'; flags.push(`Bounce ${round(bounce)}% >= throttle cap ${T.bounceThrottlePct}%`); }\n  else if (bounce >= T.bounceWarnPct) { hardTier = 'WATCH'; flags.push(`Bounce ${round(bounce)}% >= warn level ${T.bounceWarnPct}%`); }\n  if (spam >= T.spamCriticalPct) { hardTier = 'CRITICAL'; flags.push(`Spam complaints ${round(spam, 3)}% >= critical cap ${T.spamCriticalPct}%`); }\n  else if (spam >= T.spamWarnPct) { hardTier = worse(hardTier, 'WATCH'); flags.push(`Spam complaints ${round(spam, 3)}% >= warn level ${T.spamWarnPct}%`); }\n  if (util > T.volumeUtilizationWarnPct) flags.push(`Volume at ${round(util, 1)}% of daily limit`);\n  if (rep < T.reputationFloorPct) flags.push(`Warm-up reputation ${rep}% below floor ${T.reputationFloorPct}%`);\n  const lowSample = sent < T.minMailboxSample;\n  if (lowSample) flags.push(`Low sample (${sent} sends) \u2014 rates are noisy`);\n\n  const active = status === 'active';\n  if (!active) flags.push(`Mailbox status \"${status}\" \u2014 excluded from campaign health weighting`);\n\n  return {\n    mailbox_id: String(m.mailbox_id),\n    sending_domain: m.sending_domain || null,\n    provider: m.provider || 'unknown',\n    status,\n    active,\n    sent_7d: sent,\n    bounce_rate_pct: round(bounce),\n    spam_complaint_rate_pct: round(spam, 3),\n    volume_utilization_pct: round(util, 1),\n    warmup_reputation_pct: rep,\n    health_score: round(score, 1),\n    penalties: Object.fromEntries(Object.entries(penalties).map(([k, v]) => [k, round(v, 1)])),\n    tier: worse(tierFromScore(score), hardTier),\n    low_sample: lowSample,\n    flags,\n  };\n});\nconst mailboxById = Object.fromEntries(mailboxes.map((m) => [m.mailbox_id, m]));\nconst activeMailboxes = mailboxes.filter((m) => m.active);\n\n// ---------------------------------------------------------------------\n// 2. Global circuit breaker\n// ---------------------------------------------------------------------\nconst totalSent = activeMailboxes.reduce((a, m) => a + m.sent_7d, 0);\nconst orgBounceRate = totalSent > 0 ? activeMailboxes.reduce((a, m) => a + m.bounce_rate_pct * m.sent_7d, 0) / totalSent : 0;\nconst criticalCount = activeMailboxes.filter((m) => m.tier === 'CRITICAL').length;\nconst criticalPct = activeMailboxes.length ? pct(criticalCount, activeMailboxes.length) : 0;\nconst cbReasons = [];\nif (!activeMailboxes.length) cbReasons.push('DATA_ANOMALY: no active mailboxes in the dataset');\nif (!campaignsIn.length) cbReasons.push('DATA_ANOMALY: no campaigns in the dataset');\nif (criticalPct >= CB.criticalMailboxPct) cbReasons.push(`${round(criticalPct, 1)}% of active mailboxes are CRITICAL (breaker at ${CB.criticalMailboxPct}%)`);\nif (orgBounceRate >= CB.orgBounceRatePct) cbReasons.push(`Org-wide bounce rate ${round(orgBounceRate)}% (breaker at ${CB.orgBounceRatePct}%)`);\nconst circuitBreaker = {\n  tripped: cbReasons.length > 0,\n  reasons: cbReasons,\n  org_bounce_rate_pct: round(orgBounceRate),\n  critical_mailbox_pct: round(criticalPct, 1),\n  critical_mailboxes: criticalCount,\n  active_mailboxes: activeMailboxes.length,\n  recommended_action: cbReasons.length ? 'Freeze automated pacing changes, pause affected campaigns manually, and investigate list quality and DNS/authentication before resuming.' : null,\n};\n\n// ---------------------------------------------------------------------\n// 3. Velocity helpers\n// ---------------------------------------------------------------------\nconst VELOCITY_MULT = { HIGH: V.compressMultiplier, NORMAL: 1, SLUGGISH: V.expandMultiplier, STALLED: V.stalledMultiplier, INSUFFICIENT_DATA: 1 };\nconst HEALTH_MULT = { HEALTHY: 1, WATCH: H.watchMultiplier, THROTTLE: H.throttleMultiplier };\n\nfunction stepVelocity(campaignId, step) {\n  const sent = num(step.sent);\n  const replyRate = pct(num(step.replies), sent);\n  const clickRate = pct(num(step.clicks), sent);\n  const unsubRate = pct(num(step.unsubscribes), sent);\n  const evHours = events\n    .filter((e) => String(e.campaign_id) === String(campaignId) && num(e.step_number) === num(step.step_number) && ['reply', 'click'].includes(e.event))\n    .map((e) => num(e.hours_since_send, NaN)).filter(Number.isFinite);\n  let hours = null; let hoursSource = 'none';\n  if (evHours.length >= 5) { hours = median(evHours); hoursSource = `events(n=${evHours.length})`; }\n  else if (step.median_hours_to_engagement != null && num(step.median_hours_to_engagement) > 0) { hours = num(step.median_hours_to_engagement); hoursSource = 'step_metric'; }\n\n  const replyComp = Math.min(replyRate / V.benchmarkReplyRatePct, 3);\n  const clickComp = Math.min(clickRate / V.benchmarkClickRatePct, 3);\n  const timeComp = hours ? Math.min(V.benchmarkHoursToEngagement / hours, 3) : 1;\n  const index = 0.6 * replyComp + 0.25 * clickComp + 0.15 * timeComp;\n\n  let band;\n  if (sent < P.minStepSampleSize) band = 'INSUFFICIENT_DATA';\n  else if (index >= V.highThreshold) band = 'HIGH';\n  else if (index >= V.sluggishThreshold) band = 'NORMAL';\n  else if (index >= V.stalledThreshold) band = 'SLUGGISH';\n  else band = 'STALLED';\n\n  return {\n    sent,\n    reply_rate_pct: round(replyRate),\n    click_rate_pct: round(clickRate),\n    unsubscribe_rate_pct: round(unsubRate),\n    median_hours_to_engagement: hours != null ? round(hours, 1) : null,\n    hours_source: hoursSource,\n    velocity_index: round(index, 3),\n    band,\n  };\n}\n\n// ---------------------------------------------------------------------\n// 4. Campaign evaluation\n// ---------------------------------------------------------------------\nconst filter = cfg.outbound.campaignIdFilter || [];\nconst campaigns = campaignsIn\n  .filter((c) => !filter.length || filter.includes(String(c.campaign_id)))\n  .map((c) => {\n    const campaignId = String(c.campaign_id);\n    const status = String(c.status || 'unknown').toLowerCase();\n    const base = { campaign_id: campaignId, name: c.name || campaignId, segment: c.segment || null, status, active_prospects: num(c.active_prospects) };\n\n    if (status !== 'active') {\n      return { ...base, decision: 'SKIPPED_INACTIVE', health: null, velocity: null, adjustments: [], notes: [`Campaign status is \"${status}\" \u2014 not evaluated.`] };\n    }\n\n    // Campaign health (send-weighted across active mailboxes)\n    const mbs = (c.mailbox_ids || []).map((id) => mailboxById[String(id)]).filter((m) => m && m.active);\n    const notes = [];\n    let campaignHealth;\n    if (!mbs.length) {\n      campaignHealth = { score: null, tier: 'WATCH', worst_mailbox_tier: null, critical_send_share_pct: 0, mailbox_ids: [] };\n      notes.push('No active mailbox health data for this campaign \u2014 compression disabled.');\n    } else {\n      const w = mbs.reduce((a, m) => a + Math.max(1, m.sent_7d), 0);\n      const score = mbs.reduce((a, m) => a + m.health_score * Math.max(1, m.sent_7d), 0) / w;\n      const worst = worse(...mbs.map((m) => m.tier));\n      const critShare = mbs.filter((m) => m.tier === 'CRITICAL').reduce((a, m) => a + Math.max(1, m.sent_7d), 0) / w;\n      const inherited = worst === 'CRITICAL' ? 'THROTTLE' : worst === 'THROTTLE' ? 'WATCH' : 'HEALTHY';\n      const tier = worse(tierFromScore(score), inherited, critShare >= 0.5 ? 'CRITICAL' : 'HEALTHY');\n      campaignHealth = { score: round(score, 1), tier, worst_mailbox_tier: worst, critical_send_share_pct: round(critShare * 100, 1), mailbox_ids: mbs.map((m) => m.mailbox_id) };\n      const atRisk = mbs.filter((m) => m.tier !== 'HEALTHY').map((m) => `${m.mailbox_id} (${m.tier})`);\n      if (atRisk.length) notes.push(`At-risk mailboxes: ${atRisk.join(', ')}`);\n    }\n\n    // Steps and transitions\n    const steps = [...(c.steps || [])].sort((a, b) => num(a.step_number) - num(b.step_number));\n    const stepVel = steps.map((s) => ({ step_number: num(s.step_number), ...stepVelocity(campaignId, s) }));\n    const adjustments = [];\n    for (let i = 1; i < steps.length; i++) {\n      const prev = stepVel[i - 1];\n      const target = steps[i];\n      const current = num(target.delay_days);\n      const reasons = [];\n      let band = prev.band;\n\n      if (band === 'HIGH' && prev.unsubscribe_rate_pct >= T.unsubscribeGuardPct) {\n        band = 'NORMAL';\n        reasons.push(`Unsubscribe rate ${prev.unsubscribe_rate_pct}% >= guard ${T.unsubscribeGuardPct}% \u2014 compression cancelled`);\n      }\n      let vMult = VELOCITY_MULT[band];\n      if (vMult < 1 && campaignHealth.tier !== 'HEALTHY') { vMult = 1; reasons.push(`Compression blocked: campaign health is ${campaignHealth.tier}`); }\n      if (vMult < 1 && circuitBreaker.tripped) { vMult = 1; reasons.push('Compression blocked: circuit breaker tripped'); }\n      if (band === 'INSUFFICIENT_DATA') reasons.push(`Step ${prev.step_number} has ${prev.sent} sends (< ${P.minStepSampleSize}) \u2014 velocity held neutral`);\n      if (band === 'HIGH' && vMult < 1) reasons.push(`High velocity on step ${prev.step_number} (index ${prev.velocity_index}) \u2014 tighten gap`);\n      if (band === 'SLUGGISH') reasons.push(`Sluggish engagement on step ${prev.step_number} (index ${prev.velocity_index}) \u2014 extend gap`);\n      if (band === 'STALLED') reasons.push(`Stalled engagement on step ${prev.step_number} (index ${prev.velocity_index}) \u2014 extend gap`);\n\n      let proposed;\n      let hMult = 1;\n      if (campaignHealth.tier === 'CRITICAL') {\n        proposed = P.maxStepDelayDays;\n        reasons.push(`Campaign health CRITICAL \u2014 emergency expansion to max delay ${P.maxStepDelayDays}d (pause recommended)`);\n      } else {\n        hMult = HEALTH_MULT[campaignHealth.tier] ?? 1;\n        if (hMult > 1) reasons.push(`Health ${campaignHealth.tier} \u2014 throttle multiplier x${hMult}`);\n        const raw = Math.round(current * vMult * hMult);\n        proposed = clamp(raw, P.minStepDelayDays, P.maxStepDelayDays);\n        if (proposed !== raw) reasons.push(`Clamped to bounds [${P.minStepDelayDays}d, ${P.maxStepDelayDays}d]`);\n        if (Math.abs(proposed - current) > P.maxDelayChangeDaysPerRun) {\n          proposed = current + Math.sign(proposed - current) * P.maxDelayChangeDaysPerRun;\n          proposed = clamp(proposed, P.minStepDelayDays, P.maxStepDelayDays);\n          reasons.push(`Change limited to ${P.maxDelayChangeDaysPerRun}d per run`);\n        }\n      }\n      if (current < P.minStepDelayDays || current > P.maxStepDelayDays) reasons.push(`Current delay ${current}d was outside bounds \u2014 enforced`);\n\n      const delta = proposed - current;\n      adjustments.push({\n        from_step: prev.step_number,\n        to_step: num(target.step_number),\n        current_delay_days: current,\n        proposed_delay_days: proposed,\n        delta_days: delta,\n        direction: delta < 0 ? 'COMPRESS' : delta > 0 ? 'EXPAND' : 'HOLD',\n        velocity_band: band,\n        velocity_index: prev.velocity_index,\n        velocity_multiplier: vMult,\n        health_multiplier: campaignHealth.tier === 'CRITICAL' ? null : hMult,\n        reasons: reasons.length ? reasons : ['Within normal range \u2014 no change'],\n      });\n    }\n\n    // Campaign-level velocity & shift vs baseline\n    const sampled = stepVel.filter((s) => s.band !== 'INSUFFICIENT_DATA');\n    const sw = sampled.reduce((a, s) => a + s.sent, 0);\n    const campIndex = sw > 0 ? sampled.reduce((a, s) => a + s.velocity_index * s.sent, 0) / sw : null;\n    const baseline = c.baseline_velocity_index_30d != null ? num(c.baseline_velocity_index_30d) : null;\n    const shiftPct = campIndex != null && baseline ? ((campIndex - baseline) / baseline) * 100 : null;\n    const campBand = campIndex == null ? 'INSUFFICIENT_DATA' : campIndex >= V.highThreshold ? 'HIGH' : campIndex >= V.sluggishThreshold ? 'NORMAL' : campIndex >= V.stalledThreshold ? 'SLUGGISH' : 'STALLED';\n\n    const changed = adjustments.some((a) => a.delta_days !== 0);\n    return {\n      ...base,\n      decision: changed ? 'UPDATE' : 'NO_CHANGE',\n      priority: (RANK[campaignHealth.tier] ?? 0) * 100 + adjustments.reduce((a, x) => a + Math.abs(x.delta_days), 0),\n      health: campaignHealth,\n      velocity: {\n        index: campIndex != null ? round(campIndex, 3) : null,\n        band: campBand,\n        baseline_index_30d: baseline,\n        shift_pct: shiftPct != null ? round(shiftPct, 1) : null,\n        significant_shift: shiftPct != null && Math.abs(shiftPct) >= V.shiftAlertPct,\n        steps: stepVel,\n      },\n      adjustments,\n      notes,\n    };\n  });\n\n// ---------------------------------------------------------------------\n// 5. Run-level guardrails: circuit breaker + per-run update cap\n// ---------------------------------------------------------------------\nconst toUpdate = campaigns.filter((c) => c.decision === 'UPDATE').sort((a, b) => b.priority - a.priority);\ntoUpdate.forEach((c, idx) => {\n  if (circuitBreaker.tripped) { c.decision = 'BLOCKED_CIRCUIT_BREAKER'; c.notes.push('Circuit breaker tripped \u2014 change kept as a recommendation only.'); }\n  else if (idx >= P.maxCampaignsUpdatedPerRun) { c.decision = 'DEFERRED_RATE_LIMIT'; c.notes.push(`Per-run cap of ${P.maxCampaignsUpdatedPerRun} campaigns reached \u2014 deferred to next run.`); }\n});\n\nconst allAdj = campaigns.flatMap((c) => c.adjustments.map((a) => ({ ...a, campaign_id: c.campaign_id })));\nconst stats = {\n  mailboxes_evaluated: mailboxes.length,\n  mailboxes_by_tier: Object.fromEntries(TIERS.map((t) => [t, mailboxes.filter((m) => m.tier === t).length])),\n  campaigns_evaluated: campaigns.filter((c) => c.decision !== 'SKIPPED_INACTIVE').length,\n  campaigns_skipped: campaigns.filter((c) => c.decision === 'SKIPPED_INACTIVE').length,\n  campaigns_with_changes: campaigns.filter((c) => ['UPDATE', 'BLOCKED_CIRCUIT_BREAKER', 'DEFERRED_RATE_LIMIT'].includes(c.decision)).length,\n  campaigns_queued_for_update: campaigns.filter((c) => c.decision === 'UPDATE').length,\n  step_gaps_evaluated: allAdj.length,\n  step_gaps_compressed: allAdj.filter((a) => a.direction === 'COMPRESS').length,\n  step_gaps_expanded: allAdj.filter((a) => a.direction === 'EXPAND').length,\n  step_gaps_held: allAdj.filter((a) => a.direction === 'HOLD').length,\n  significant_velocity_shifts: campaigns.filter((c) => c.velocity && c.velocity.significant_shift).length,\n};\n\nreturn [{\n  json: {\n    runId: ctx.runId,\n    startedAt: ctx.startedAt,\n    trigger: ctx.trigger,\n    workflow: ctx.workflow,\n    workflowVersion: ctx.workflowVersion,\n    dataSource: ctx.dataSource,\n    dataAsOf: metrics.fixture_meta ? metrics.fixture_meta.as_of : null,\n    config: cfg,\n    gate,\n    circuitBreaker,\n    stats,\n    mailboxes,\n    campaigns,\n    evaluatedAt: new Date().toISOString(),\n  },\n}];\n"
+      },
+      "id": "738578d4-db12-5792-b44d-99049c0785a5",
+      "name": "Pacing Optimization Engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Build Pacing Update Payloads\n// Turns every campaign with decision=UPDATE into one batch payload that\n// sets the step-to-step delays in the outbound engine. Payloads are\n// always built (for preview & audit); whether they are SENT is decided\n// by liveUpdateAllowed, which needs every safety flag to agree.\n// =====================================================================\nconst plan = $input.first().json;\nconst { gate, config: cfg } = plan;\n\n// FNV-1a 32-bit hash: deterministic idempotency keys without crypto.\nconst fnv1a = (s) => {\n  let h = 0x811c9dc5;\n  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }\n  return h.toString(16).padStart(8, '0');\n};\nconst runDate = String(plan.startedAt).slice(0, 10);\n\nconst payloads = plan.campaigns\n  .filter((c) => c.decision === 'UPDATE' || c.decision === 'BLOCKED_CIRCUIT_BREAKER' || c.decision === 'DEFERRED_RATE_LIMIT')\n  .map((c) => {\n    const changes = c.adjustments.filter((a) => a.delta_days !== 0);\n    const sequenceDelays = changes.map((a) => ({\n      step_number: a.to_step,\n      delay_in_days: a.proposed_delay_days,\n      previous_delay_in_days: a.current_delay_days,\n    }));\n    const fingerprint = `${c.campaign_id}|${runDate}|${sequenceDelays.map((d) => `${d.step_number}:${d.delay_in_days}`).join(',')}`;\n    return {\n      campaign_id: c.campaign_id,\n      campaign_name: c.name,\n      decision: c.decision,\n      idempotency_key: `pacing-${c.campaign_id}-${fnv1a(fingerprint)}`,\n      body: {\n        campaign_id: c.campaign_id,\n        sequence_delays: sequenceDelays,\n        change_summary: changes.map((a) => `Step ${a.from_step}->${a.to_step}: ${a.current_delay_days}d -> ${a.proposed_delay_days}d (${a.direction}, ${a.velocity_band})`),\n        health_tier: c.health ? c.health.tier : null,\n        source: 'n8n-outbound-sequence-step-pacing-optimization-engine',\n        run_id: plan.runId,\n        requested_at: new Date().toISOString(),\n      },\n    };\n  });\n\nconst queued = payloads.filter((p) => p.decision === 'UPDATE');\nconst liveUpdateAllowed = gate.liveMutationsPermitted === true\n  && gate.sandboxMode === false\n  && gate.dryRun === false\n  && plan.circuitBreaker.tripped === false\n  && queued.length > 0;\n\nlet deliveryMode;\nif (gate.sandboxMode) deliveryMode = 'SANDBOX_PREVIEW';\nelse if (plan.circuitBreaker.tripped) deliveryMode = 'BLOCKED_CIRCUIT_BREAKER';\nelse if (gate.configErrors && gate.configErrors.length) deliveryMode = 'BLOCKED_CONFIG_INVALID';\nelse if (gate.requested.dryRun) deliveryMode = 'DRY_RUN_PREVIEW';\nelse if (!gate.requested.pacingUpdatesEnabled) deliveryMode = 'UPDATES_DISABLED_PREVIEW';\nelse if (!queued.length) deliveryMode = 'NOTHING_TO_UPDATE';\nelse deliveryMode = 'LIVE';\n\nconst endpointTemplate = `${cfg.outbound.apiBaseUrl}${cfg.outbound.pacingUpdatePath}`;\n\nreturn [{\n  json: {\n    ...plan,\n    pacingUpdate: {\n      liveUpdateAllowed,\n      deliveryMode,\n      endpointTemplate,\n      payloadCount: payloads.length,\n      queuedCount: queued.length,\n      payloads,\n    },\n  },\n}];\n"
+      },
+      "id": "a80927fe-337a-581b-95ea-71774e60ad80",
+      "name": "Build Pacing Update Payloads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1720,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "749da4fc-952b-504a-9ee8-9df540298978",
+              "leftValue": "={{ $json.pacingUpdate.liveUpdateAllowed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ec5ccd02-54d4-57c6-a418-4566aa5a575a",
+      "name": "Live Update Allowed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Split Pacing Payloads (live branch only)\n// Second, independent safety check: refuses to emit anything unless every\n// gate flag still allows live writes. One output item per campaign.\n// =====================================================================\nconst plan = $input.first().json;\nconst g = plan.gate;\nconst pu = plan.pacingUpdate;\n\nif (!(pu.liveUpdateAllowed === true && g.liveMutationsPermitted === true && g.sandboxMode === false && g.dryRun === false && plan.circuitBreaker.tripped === false)) {\n  throw new Error('Safety interlock: live pacing update branch reached without full authorization. No requests were sent.');\n}\n\nreturn pu.payloads\n  .filter((p) => p.decision === 'UPDATE')\n  .map((p) => ({\n    json: {\n      campaign_id: p.campaign_id,\n      idempotency_key: p.idempotency_key,\n      url: pu.endpointTemplate.replace('{campaign_id}', encodeURIComponent(p.campaign_id)),\n      body: p.body,\n    },\n  }));\n"
+      },
+      "id": "b9a33839-a750-5092-b73f-10d9e23d5ee7",
+      "name": "Split Pacing Payloads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2200,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.OUTBOUND_API_KEY }}"
+            },
+            {
+              "name": "Idempotency-Key",
+              "value": "={{ $json.idempotency_key }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 1500
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "bd0dc32f-d48d-5f36-8d7c-d52353070015",
+      "name": "Apply Pacing Update (Live)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2440,
+        160
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Collect Update Results (live branch)\n// Pairs each HTTP response with its campaign and records APPLIED/FAILED.\n// =====================================================================\nconst plan = $('Build Pacing Update Payloads').first().json;\nconst sentItems = $('Split Pacing Payloads').all();\nconst responses = $input.all();\n\nconst results = responses.map((r, i) => {\n  const idx = r.pairedItem && typeof r.pairedItem.item === 'number' ? r.pairedItem.item : i;\n  const req = (sentItems[idx] || sentItems[i] || { json: {} }).json;\n  const j = r.json || {};\n  const status = Number(j.statusCode);\n  const ok = !j.error && (Number.isFinite(status) ? status >= 200 && status < 300 : true);\n  const errMsg = j.error ? String(j.error.message || j.error).slice(0, 300) : null;\n  return {\n    campaign_id: req.campaign_id,\n    idempotency_key: req.idempotency_key,\n    status: ok ? 'APPLIED' : 'FAILED',\n    http_status: Number.isFinite(status) ? status : null,\n    error: ok ? null : (errMsg || `HTTP ${status}`),\n  };\n});\n\n// Campaigns that were not sent (deferred / blocked) are still recorded.\nconst sentIds = new Set(results.map((r) => r.campaign_id));\nfor (const p of plan.pacingUpdate.payloads) {\n  if (!sentIds.has(p.campaign_id)) results.push({ campaign_id: p.campaign_id, idempotency_key: p.idempotency_key, status: p.decision, http_status: null, error: null });\n}\n\nreturn [{\n  json: {\n    ...plan,\n    updateResults: results,\n    updateSummary: {\n      mode: 'LIVE',\n      applied: results.filter((r) => r.status === 'APPLIED').length,\n      failed: results.filter((r) => r.status === 'FAILED').length,\n      previewed: 0,\n    },\n  },\n}];\n"
+      },
+      "id": "eab6175e-73d4-5562-a3c3-cdb09a2b55dc",
+      "name": "Collect Update Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2680,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Dry-Run Pacing Preview\n// Records what WOULD have been sent. No external calls on this branch.\n// =====================================================================\nconst plan = $input.first().json;\nconst mode = plan.pacingUpdate.deliveryMode;\n\nconst results = plan.pacingUpdate.payloads.map((p) => ({\n  campaign_id: p.campaign_id,\n  idempotency_key: p.idempotency_key,\n  status: p.decision === 'UPDATE' ? mode : p.decision,\n  http_status: null,\n  error: null,\n  would_send: p.decision === 'UPDATE' ? { method: 'POST', url: plan.pacingUpdate.endpointTemplate.replace('{campaign_id}', p.campaign_id), body: p.body } : null,\n}));\n\nreturn [{\n  json: {\n    ...plan,\n    updateResults: results,\n    updateSummary: {\n      mode,\n      applied: 0,\n      failed: 0,\n      previewed: results.filter((r) => r.status === mode).length,\n    },\n  },\n}];\n"
+      },
+      "id": "351b4e8c-5fc3-5e78-8053-b5f77b5d499a",
+      "name": "Dry-Run Pacing Preview",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2200,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Build RevOps Alerts\n// Formats a Slack Block Kit message plus a compact JSON webhook event.\n// Alerts carry mailbox IDs and sending domains only \u2014 never mailbox\n// addresses or prospect data.\n// =====================================================================\nconst run = $input.first().json;\nconst { gate, circuitBreaker: cb, stats, config: cfg } = run;\nconst maxItems = cfg.alerts.maxItemsPerSection;\nconst SEV_RANK = { INFO: 0, WARNING: 1, CRITICAL: 2 };\n\nconst truncate = (s, max = 2900) => (s.length > max ? `${s.slice(0, max - 20)}\\n_\u2026truncated_` : s);\nconst tierIcon = { HEALTHY: ':large_green_circle:', WATCH: ':large_yellow_circle:', THROTTLE: ':large_orange_circle:', CRITICAL: ':red_circle:' };\nconst dirIcon = { COMPRESS: ':arrow_down:', EXPAND: ':arrow_up:', HOLD: ':left_right_arrow:' };\n\nconst atRisk = run.mailboxes.filter((m) => m.tier !== 'HEALTHY').sort((a, b) => a.health_score - b.health_score);\nconst changedCampaigns = run.campaigns.filter((c) => c.adjustments && c.adjustments.some((a) => a.delta_days !== 0));\nconst shifts = run.campaigns.filter((c) => c.velocity && c.velocity.significant_shift);\n\nlet severity = 'INFO';\nif (atRisk.length || changedCampaigns.length || shifts.length) severity = 'WARNING';\nif (cb.tripped || stats.mailboxes_by_tier.CRITICAL > 0 || (run.updateSummary && run.updateSummary.failed > 0)) severity = 'CRITICAL';\n\nconst modeLabel = {\n  LIVE: ':satellite_antenna: LIVE',\n  SANDBOX_PREVIEW: ':test_tube: SANDBOX (mock data)',\n  DRY_RUN_PREVIEW: ':eyes: DRY RUN',\n  UPDATES_DISABLED_PREVIEW: ':lock: UPDATES DISABLED',\n  BLOCKED_CIRCUIT_BREAKER: ':octagonal_sign: BLOCKED (circuit breaker)',\n  BLOCKED_CONFIG_INVALID: ':no_entry: BLOCKED (invalid config)',\n  NOTHING_TO_UPDATE: ':white_check_mark: NO CHANGES',\n}[run.updateSummary.mode] || run.updateSummary.mode;\n\nconst sevHeader = { INFO: ':white_check_mark: Outbound Pacing Run \u2014 All Clear', WARNING: ':warning: Outbound Pacing Run \u2014 Adjustments & Warnings', CRITICAL: ':rotating_light: Outbound Pacing Run \u2014 Critical Deliverability Alert' }[severity];\n\nconst blocks = [];\nblocks.push({ type: 'header', text: { type: 'plain_text', text: sevHeader.slice(0, 150), emoji: true } });\nblocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `*Run* \\`${run.runId}\\`  \u00b7  *Mode* ${modeLabel}  \u00b7  *Source* ${run.dataSource}  \u00b7  *Trigger* ${run.trigger}  \u00b7  ${run.evaluatedAt}` }] });\n\nif (cb.tripped) {\n  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: truncate(`:octagonal_sign: *CIRCUIT BREAKER TRIPPED \u2014 all automated pacing changes frozen*\\n${cb.reasons.map((r) => `\u2022 ${r}`).join('\\n')}\\n*Recommended:* ${cb.recommended_action}`) } });\n}\n\nblocks.push({\n  type: 'section',\n  fields: [\n    { type: 'mrkdwn', text: `*Mailboxes evaluated*\\n${stats.mailboxes_evaluated}` },\n    { type: 'mrkdwn', text: `*At-risk mailboxes*\\n${atRisk.length} (${stats.mailboxes_by_tier.CRITICAL} critical)` },\n    { type: 'mrkdwn', text: `*Campaigns evaluated*\\n${stats.campaigns_evaluated} (${stats.campaigns_skipped} skipped)` },\n    { type: 'mrkdwn', text: `*Step gaps changed*\\n${stats.step_gaps_compressed} compressed \u00b7 ${stats.step_gaps_expanded} expanded` },\n    { type: 'mrkdwn', text: `*Updates*\\n${run.updateSummary.applied} applied \u00b7 ${run.updateSummary.previewed} previewed \u00b7 ${run.updateSummary.failed} failed` },\n    { type: 'mrkdwn', text: `*Org bounce rate (7d)*\\n${cb.org_bounce_rate_pct}% (breaker ${cfg.circuitBreaker.orgBounceRatePct}%)` },\n  ],\n});\n\nblocks.push({ type: 'divider' });\nif (atRisk.length) {\n  const lines = atRisk.slice(0, maxItems).map((m) => `${tierIcon[m.tier]} \\`${m.mailbox_id}\\` *${m.tier}* \u00b7 score ${m.health_score} \u00b7 bounce ${m.bounce_rate_pct}% \u00b7 spam ${m.spam_complaint_rate_pct}% \u00b7 util ${m.volume_utilization_pct}% \u00b7 ${m.sending_domain || 'n/a'}`);\n  if (atRisk.length > maxItems) lines.push(`_+${atRisk.length - maxItems} more in the audit log_`);\n  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: truncate(`*:mailbox_with_mail: Mailbox health warnings*\\n${lines.join('\\n')}`) } });\n} else {\n  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '*:mailbox_with_mail: Mailbox health*\\nAll active mailboxes are HEALTHY.' } });\n}\n\nblocks.push({ type: 'divider' });\nif (changedCampaigns.length) {\n  const resultBy = Object.fromEntries((run.updateResults || []).map((r) => [r.campaign_id, r.status]));\n  const parts = changedCampaigns.slice(0, maxItems).map((c) => {\n    const rows = c.adjustments.filter((a) => a.delta_days !== 0).map((a) => `      ${dirIcon[a.direction]} Step ${a.from_step}\u2192${a.to_step}: ${a.current_delay_days}d \u2192 *${a.proposed_delay_days}d* (${a.velocity_band})`);\n    return `${tierIcon[c.health.tier]} *${c.campaign_id} \u00b7 ${c.name}* \u2014 health ${c.health.tier}, status \\`${resultBy[c.campaign_id] || c.decision}\\`\\n${rows.join('\\n')}`;\n  });\n  if (changedCampaigns.length > maxItems) parts.push(`_+${changedCampaigns.length - maxItems} more campaigns in the audit log_`);\n  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: truncate(`*:hourglass_flowing_sand: Pacing adjustments*\\n${parts.join('\\n')}`) } });\n} else {\n  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '*:hourglass_flowing_sand: Pacing adjustments*\\nNo step-delay changes this run.' } });\n}\n\nif (shifts.length) {\n  const lines = shifts.slice(0, maxItems).map((c) => `${c.velocity.shift_pct > 0 ? ':chart_with_upwards_trend:' : ':chart_with_downwards_trend:'} *${c.campaign_id}* velocity ${c.velocity.index} vs 30d baseline ${c.velocity.baseline_index_30d} (${c.velocity.shift_pct > 0 ? '+' : ''}${c.velocity.shift_pct}%) \u00b7 band ${c.velocity.band}`);\n  blocks.push({ type: 'divider' });\n  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: truncate(`*:zap: Campaign velocity shifts*\\n${lines.join('\\n')}`) } });\n}\n\nconst footer = run.updateSummary.mode === 'LIVE'\n  ? 'Changes were written to the outbound platform. Review the audit log for per-campaign results.'\n  : 'Preview only \u2014 no changes were written to the outbound platform.';\nblocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `${footer}  \u00b7  n8n-outbound-sequence-step-pacing-optimization-engine v${run.workflowVersion}` }] });\n\nconst fallbackText = `[${severity}] Outbound pacing run ${run.runId}: ${atRisk.length} at-risk mailboxes, ${changedCampaigns.length} campaigns with pacing changes, mode ${run.updateSummary.mode}.`;\n\nconst meetsSeverity = SEV_RANK[severity] >= SEV_RANK[cfg.alerts.minSeverity];\nconst dispatch = {\n  severity,\n  meetsMinSeverity: meetsSeverity,\n  slack: gate.slackAlertsPermitted === true && meetsSeverity,\n  webhook: gate.webhookAlertsPermitted === true && meetsSeverity,\n};\n\nconst webhookEvent = {\n  event: 'outbound.pacing.run_completed',\n  run_id: run.runId,\n  severity,\n  mode: run.updateSummary.mode,\n  data_source: run.dataSource,\n  evaluated_at: run.evaluatedAt,\n  circuit_breaker: { tripped: cb.tripped, reasons: cb.reasons, org_bounce_rate_pct: cb.org_bounce_rate_pct },\n  stats,\n  update_summary: run.updateSummary,\n  mailbox_warnings: atRisk.map((m) => ({ mailbox_id: m.mailbox_id, tier: m.tier, health_score: m.health_score, bounce_rate_pct: m.bounce_rate_pct, spam_complaint_rate_pct: m.spam_complaint_rate_pct, sending_domain: m.sending_domain })),\n  pacing_changes: changedCampaigns.map((c) => ({\n    campaign_id: c.campaign_id,\n    health_tier: c.health.tier,\n    changes: c.adjustments.filter((a) => a.delta_days !== 0).map((a) => ({ from_step: a.from_step, to_step: a.to_step, from_days: a.current_delay_days, to_days: a.proposed_delay_days, direction: a.direction })),\n  })),\n  velocity_shifts: shifts.map((c) => ({ campaign_id: c.campaign_id, index: c.velocity.index, baseline: c.velocity.baseline_index_30d, shift_pct: c.velocity.shift_pct })),\n};\n\nreturn [{\n  json: {\n    ...run,\n    alerts: {\n      dispatch,\n      slackPayload: { text: fallbackText, blocks: blocks.slice(0, 50) },\n      webhookEvent,\n    },\n  },\n}];\n"
+      },
+      "id": "850f10a5-90da-506b-8dd2-6210e5824bc7",
+      "name": "Build RevOps Alerts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2920,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "4e233f78-16c4-579e-8344-8619c46d3bb5",
+              "leftValue": "={{ $json.alerts.dispatch.slack }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ffd6e060-1aef-567b-8fb8-5f81ba020762",
+      "name": "Send Slack Alert?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3160,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_ALERT_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.alerts.slackPayload) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "e795fe50-86b7-5808-94ea-4bb23a159ce3",
+      "name": "Post Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3400,
+        160
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "94e6daeb-f74c-5026-bc36-ed5433f34280",
+              "leftValue": "={{ $('Build RevOps Alerts').first().json.alerts.dispatch.webhook }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "10184c46-33a2-536a-9aed-7250234d6fb5",
+      "name": "Send Webhook Alert?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3640,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ALERT_WEBHOOK_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Run-Id",
+              "value": "={{ $('Build RevOps Alerts').first().json.runId }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Build RevOps Alerts').first().json.alerts.webhookEvent) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "8b21ec05-2a03-5e6b-924c-9e562f585c4d",
+      "name": "Post Alert Webhook",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3880,
+        160
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Execution Summary & Audit\n// One structured audit record per run: what was evaluated, what changed,\n// what was sent, and why. Ship this item to a log store or warehouse.\n// =====================================================================\nconst run = $('Build RevOps Alerts').first().json;\n\nconst dispatchStatus = (nodeName, wanted) => {\n  if (!wanted) return 'NOT_SENT';\n  try {\n    if (!$(nodeName).isExecuted) return 'NOT_SENT';\n    const j = $(nodeName).first().json || {};\n    return j.error ? `FAILED: ${String(j.error.message || j.error).slice(0, 200)}` : 'SENT';\n  } catch (e) {\n    return 'UNKNOWN';\n  }\n};\n\nconst finishedAt = new Date().toISOString();\nconst durationMs = new Date(finishedAt).getTime() - new Date(run.startedAt).getTime();\n\nconst changes = run.campaigns.flatMap((c) => (c.adjustments || [])\n  .filter((a) => a.delta_days !== 0)\n  .map((a) => ({\n    campaign_id: c.campaign_id,\n    from_step: a.from_step,\n    to_step: a.to_step,\n    from_days: a.current_delay_days,\n    to_days: a.proposed_delay_days,\n    direction: a.direction,\n    velocity_band: a.velocity_band,\n    health_tier: c.health ? c.health.tier : null,\n    decision: c.decision,\n    write_status: ((run.updateResults || []).find((r) => r.campaign_id === c.campaign_id) || {}).status || 'NOT_SENT',\n    reasons: a.reasons,\n  })));\n\nreturn [{\n  json: {\n    audit: {\n      run_id: run.runId,\n      workflow: run.workflow,\n      workflow_version: run.workflowVersion,\n      trigger: run.trigger,\n      started_at: run.startedAt,\n      finished_at: finishedAt,\n      duration_ms: durationMs,\n      data_source: run.dataSource,\n      data_as_of: run.dataAsOf,\n      safety: {\n        mode: run.gate.mode,\n        sandbox_mode: run.gate.sandboxMode,\n        dry_run: run.gate.dryRun,\n        live_mutations_permitted: run.gate.liveMutationsPermitted,\n        delivery_mode: run.updateSummary.mode,\n        circuit_breaker_tripped: run.circuitBreaker.tripped,\n        circuit_breaker_reasons: run.circuitBreaker.reasons,\n        gate_reasons: run.gate.reasons,\n        config_warnings: run.gate.warnings,\n        config_errors: run.gate.configErrors,\n      },\n      stats: run.stats,\n      update_summary: run.updateSummary,\n      alerts: {\n        severity: run.alerts.dispatch.severity,\n        slack: dispatchStatus('Post Slack Alert', run.alerts.dispatch.slack),\n        webhook: dispatchStatus('Post Alert Webhook', run.alerts.dispatch.webhook),\n      },\n      mailbox_health: run.mailboxes.map((m) => ({ mailbox_id: m.mailbox_id, tier: m.tier, health_score: m.health_score, bounce_rate_pct: m.bounce_rate_pct, spam_complaint_rate_pct: m.spam_complaint_rate_pct, volume_utilization_pct: m.volume_utilization_pct })),\n      campaign_decisions: run.campaigns.map((c) => ({ campaign_id: c.campaign_id, decision: c.decision, health_tier: c.health ? c.health.tier : null, velocity_band: c.velocity ? c.velocity.band : null, velocity_shift_pct: c.velocity ? c.velocity.shift_pct : null, notes: c.notes })),\n      pacing_changes: changes,\n      thresholds_snapshot: { thresholds: run.config.thresholds, pacing: run.config.pacing, velocity: run.config.velocity, health: run.config.health, circuit_breaker: run.config.circuitBreaker },\n    },\n  },\n}];\n"
+      },
+      "id": "7e6e5392-1f5f-542f-b22e-fb48b9cc113b",
+      "name": "Execution Summary & Audit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Safe by default\nImported as-is this workflow makes **zero network calls**.\n\n- `SANDBOX_MODE=true` \u2192 mock fixture only\n- `DRY_RUN=true` \u2192 no writes\n- `PACING_UPDATES_ENABLED=false` \u2192 preview only\n- `SEND_SLACK_ALERTS=false`\n\nLive writes need all four flipped, a real `OUTBOUND_API_KEY`, a non-placeholder base URL, valid config, and an untripped circuit breaker.",
+        "height": 360,
+        "width": 460,
+        "color": 4
+      },
+      "id": "1fd415fd-b7b7-51a9-a555-b15cf60fac9b",
+      "name": "Note: Safe by Default",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -220
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Pacing engine\nMailbox health score \u2192 campaign tier \u2192 step velocity index \u2192 proposed gap.\n\nGuardrails: min/max delay, max change per run, no compression when health \u2260 HEALTHY, unsubscribe guard, per-run campaign cap, global circuit breaker.",
+        "height": 300,
+        "width": 400,
+        "color": 5
+      },
+      "id": "6cdefdf9-9e3b-54aa-b0b0-bd52fa0b1ae3",
+      "name": "Note: Engine",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1420,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Live write path\n`Split Pacing Payloads` re-checks every safety flag and throws if any disagree.\n\nOne POST per campaign, 1.5s apart, with an `Idempotency-Key` header.",
+        "height": 240,
+        "width": 520,
+        "color": 3
+      },
+      "id": "9b84414a-7748-5a44-9b13-859d69878f50",
+      "name": "Note: Live Writes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2160,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Alerts & audit\nSlack Block Kit + generic JSON webhook. Both are blocked in sandbox and filtered by `ALERT_MIN_SEVERITY`.\n\nThe final node emits one audit record per run \u2014 send it to your log store.",
+        "height": 240,
+        "width": 520,
+        "color": 6
+      },
+      "id": "2764b523-2488-5b74-8f1b-a1e682ddfc01",
+      "name": "Note: Alerts & Audit",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        3120,
+        -120
+      ]
+    }
+  ],
+  "connections": {
+    "Daily 07:00 UTC Schedule": {
+      "main": [
+        [
+          {
+            "node": "Config & Safety Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Test Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config & Safety Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config & Safety Gate": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Mode?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Mode?": {
+      "main": [
+        [
+          {
+            "node": "Load Mock Fixture",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fetch Mailbox Health (Live)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Mock Fixture": {
+      "main": [
+        [
+          {
+            "node": "Pacing Optimization Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Mailbox Health (Live)": {
+      "main": [
+        [
+          {
+            "node": "Fetch Campaign Metrics (Live)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Campaign Metrics (Live)": {
+      "main": [
+        [
+          {
+            "node": "Normalize Live Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Live Metrics": {
+      "main": [
+        [
+          {
+            "node": "Pacing Optimization Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pacing Optimization Engine": {
+      "main": [
+        [
+          {
+            "node": "Build Pacing Update Payloads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Pacing Update Payloads": {
+      "main": [
+        [
+          {
+            "node": "Live Update Allowed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Live Update Allowed?": {
+      "main": [
+        [
+          {
+            "node": "Split Pacing Payloads",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Dry-Run Pacing Preview",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Pacing Payloads": {
+      "main": [
+        [
+          {
+            "node": "Apply Pacing Update (Live)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Pacing Update (Live)": {
+      "main": [
+        [
+          {
+            "node": "Collect Update Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Update Results": {
+      "main": [
+        [
+          {
+            "node": "Build RevOps Alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dry-Run Pacing Preview": {
+      "main": [
+        [
+          {
+            "node": "Build RevOps Alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build RevOps Alerts": {
+      "main": [
+        [
+          {
+            "node": "Send Slack Alert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Slack Alert?": {
+      "main": [
+        [
+          {
+            "node": "Post Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Webhook Alert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Slack Alert": {
+      "main": [
+        [
+          {
+            "node": "Send Webhook Alert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Webhook Alert?": {
+      "main": [
+        [
+          {
+            "node": "Post Alert Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Execution Summary & Audit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Alert Webhook": {
+      "main": [
+        [
+          {
+            "node": "Execution Summary & Audit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}
